@@ -532,6 +532,201 @@ def novel_sandbox_probe():
     }
 
 
+
+def escape_recon():
+    """Read-only sandbox-escape reconnaissance. No exploit payloads."""
+    import stat as statmod
+    results = {
+        "goal": "Determine if novel container escape primitives exist beyond network/metrics finding",
+        "safety": "read-only filesystem/proc/net probes only",
+    }
+
+    # Identity / privilege
+    results["identity"] = {
+        "uid_map": try_read("/proc/self/uid_map"),
+        "gid_map": try_read("/proc/self/gid_map"),
+        "status": try_run(["sh", "-c", "grep -E '^(Uid|Gid|Cap|NSpid|NoNewPrivs|Seccomp|Speculation)' /proc/self/status"]),
+        "id": try_run(["id"]),
+        "uname": try_run(["uname", "-a"]),
+        "containerenv": try_read("/run/.containerenv", 4000),
+    }
+
+    # Runtime version fingerprints
+    results["runtime_versions"] = {
+        "podman": try_run(["podman", "--version"]),
+        "crun": try_run(["crun", "--version"]),
+        "runc": try_run(["runc", "--version"]),
+        "which": try_run(["sh", "-c", "command -v podman; command -v crun; command -v runc; ls /usr/bin/*run* 2>/dev/null | head"]),
+    }
+
+    # Devices / sys
+    def safe_listdir(path, n=100):
+        try:
+            return sorted(os.listdir(path))[:n]
+        except Exception as e:
+            return [f"<error: {e}>"]
+
+    results["devices"] = {
+        "dev": safe_listdir("/dev"),
+        "dev_pts": safe_listdir("/dev/pts"),
+        "sys_fs_cgroup": safe_listdir("/sys/fs/cgroup"),
+        "sys_firmware": safe_listdir("/sys/firmware")[:20] if os.path.exists("/sys/firmware") else None,
+    }
+
+    # Sensitive proc knobs (read-only)
+    results["proc_knobs"] = {
+        "core_pattern": try_read("/proc/sys/kernel/core_pattern"),
+        "unprivileged_userns_clone": try_read("/proc/sys/kernel/unprivileged_userns_clone"),
+        "dmesg_restrict": try_read("/proc/sys/kernel/dmesg_restrict"),
+        "kptr_restrict": try_read("/proc/sys/kernel/kptr_restrict"),
+        "cmdline": try_read("/proc/cmdline", 1000),
+        "self_cgroup": try_read("/proc/self/cgroup"),
+        "self_mountinfo": try_read("/proc/self/mountinfo", 8000),
+        "self_root_link": try_run(["readlink", "/proc/self/root"]),
+        "1_root_link": try_run(["readlink", "/proc/1/root"]),
+        "1_cwd": try_run(["readlink", "/proc/1/cwd"]),
+        "apparmor": try_read("/proc/self/attr/current"),
+        "selinux_context_try": try_run(["sh", "-c", "cat /proc/self/attr/current 2>/dev/null; ls -laZ / 2>/dev/null | head -5"]),
+    }
+
+    # Mount / path traversal style checks (read-only existence)
+    candidates = []
+    mi = try_read("/proc/self/mountinfo", 20000)
+    # From mountinfo, collect host-looking sources
+    for line in mi.splitlines():
+        parts = line.split()
+        if len(parts) >= 5:
+            candidates.append(parts[3])  # root
+            candidates.append(parts[4])  # mountpoint
+    # Explicit interesting paths
+    explicit = [
+        "/alloc", "/alloc/..", "/alloc/../..", "/alloc/../../..",
+        "/local", "/local/..",
+        "/secrets", "/secrets/api.sock",
+        "/run/podman", "/run/podman/podman.sock",
+        "/var/run/docker.sock", "/run/docker.sock",
+        "/var/run/crio/crio.sock",
+        "/sys/fs/cgroup", "/sys/kernel/security",
+        "/proc/sysrq-trigger",
+        "/home", "/root", "/opt/nomad", "/opt/nomad/data", "/opt/nomad/data/alloc",
+    ]
+    # Sibling alloc guess: same parent dir as our alloc id from mountinfo
+    m = re.search(r"/opt/nomad/data/alloc/([0-9a-f-]+)/", mi)
+    our_alloc = m.group(1) if m else None
+    if our_alloc:
+        explicit += [
+            f"/alloc/../{our_alloc}",
+            f"/opt/nomad/data/alloc/{our_alloc}",
+            f"/opt/nomad/data/alloc/",
+        ]
+        # try listing via /proc/self/root join won't help; try common relative escapes
+        explicit += [
+            "/alloc/../logs",
+            "/alloc/../../",
+        ]
+
+    path_probe = {}
+    for path in sorted(set(explicit)):
+        info = {"exists": os.path.exists(path), "is_dir": os.path.isdir(path), "is_file": os.path.isfile(path), "is_link": os.path.islink(path)}
+        try:
+            st = os.lstat(path)
+            info["mode"] = oct(st.st_mode)
+            info["uid"] = st.st_uid
+            info["gid"] = st.st_gid
+            info["size"] = st.st_size
+            info["sock"] = statmod.S_ISSOCK(st.st_mode)
+        except Exception as e:
+            info["stat_error"] = str(e)
+        if info["is_dir"] and info["exists"]:
+            try:
+                info["children"] = sorted(os.listdir(path))[:50]
+            except Exception as e:
+                info["list_error"] = str(e)
+        if info.get("is_file") and info.get("size", 0) and info["size"] <= 2000 and path.endswith(('.env', 'current', 'core_pattern')):
+            info["content"] = try_read(path, 2000)
+        path_probe[path] = info
+    results["path_probe"] = path_probe
+    results["our_alloc_id"] = our_alloc
+
+    # Try to read foreign alloc dirs if /opt/nomad/data/alloc listable
+    foreign = {}
+    alloc_root = "/opt/nomad/data/alloc"
+    if os.path.isdir(alloc_root):
+        try:
+            kids = sorted(os.listdir(alloc_root))[:30]
+            foreign["list"] = kids
+            for kid in kids[:5]:
+                foreign[kid] = safe_listdir(os.path.join(alloc_root, kid), 20)
+        except Exception as e:
+            foreign["error"] = str(e)
+    else:
+        foreign["reachable"] = False
+    results["foreign_alloc_access"] = foreign
+
+    # Overlay lowerdir accessibility
+    overlay_paths = re.findall(r'(?:lowerdir|upperdir|workdir)=([^,\s]+)', mi)
+    ov = {}
+    for op in overlay_paths[:20]:
+        # lowerdir can be colon-separated
+        for piece in op.split(':'):
+            ov[piece] = {"exists": os.path.exists(piece), "listdir_error": None}
+            if ov[piece]["exists"] and os.path.isdir(piece):
+                try:
+                    ov[piece]["children"] = sorted(os.listdir(piece))[:20]
+                except Exception as e:
+                    ov[piece]["listdir_error"] = str(e)
+    results["overlay_path_access"] = ov
+
+    # Traefik / mystery ports (sidecar shares netns)
+    ports = [8080, 80, 443, 8081, 8082, 8443, 9000, 8090, 8888, 9999, 22766, 22557, 9100, 4194, 10250]
+    # also parse current listeners
+    for netf in ("/proc/net/tcp", "/proc/net/tcp6"):
+        text = try_read(netf, 200000)
+        for line in text.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) > 3 and parts[3] == "0A":
+                port = int(parts[1].split(":")[1], 16)
+                ports.append(port)
+    ports = sorted(set(ports))
+    port_scan = {}
+    for port in ports:
+        r = tcp_connect("127.0.0.1", port, timeout=0.5)
+        entry = {"tcp": r}
+        if r.get("open"):
+            for path in ["/", "/api/rawdata", "/api/http/routers", "/dashboard/", "/ping", "/health", "/metrics", "/version"]:
+                entry[path] = http_get_raw("127.0.0.1", port, path=path, timeout=1.2)
+        port_scan[str(port)] = entry
+    results["localhost_listeners_probe"] = port_scan
+
+    # Nomad unix socket ACL vs network already known; re-check perms only
+    results["api_sock"] = {
+        "stat": try_run(["sh", "-c", "ls -la /secrets; ls -la /secrets/api.sock 2>&1; id"]),
+        "connect": http_get_unix("/secrets/api.sock", "/v1/agent/self") if 'http_get_unix' in globals() else {"skipped": True},
+    }
+
+    # Summary heuristics
+    red_flags = []
+    if "0       0" in (results["identity"]["uid_map"] or ""):
+        red_flags.append("uid_map maps container 0 to host 0 (privileged)")
+    if os.path.exists("/var/run/docker.sock") or os.path.exists("/run/podman/podman.sock"):
+        red_flags.append("container runtime socket mounted")
+    if results["foreign_alloc_access"].get("list"):
+        red_flags.append("can list /opt/nomad/data/alloc (sibling allocs)")
+    if any(v.get("exists") for k,v in results["overlay_path_access"].items() if "/home/" in k or "containers/storage" in k):
+        red_flags.append("host overlay storage path reachable from inside")
+    # open unexpected localhost admin
+    for port, entry in port_scan.items():
+        if entry.get("tcp", {}).get("open") and port not in ("8080",):
+            # check if traefik api returned data
+            for path in ("/api/rawdata", "/api/http/routers", "/dashboard/"):
+                resp = str(entry.get(path, {}))
+                if "200" in resp and "traefik" in resp.lower():
+                    red_flags.append(f"Traefik API/dashboard open on :{port}{path}")
+    results["red_flags"] = red_flags
+    results["escape_likely"] = bool(red_flags)
+    return results
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, data, code=200):
         body = json.dumps(data, indent=2, default=str).encode()
@@ -543,6 +738,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if self.path.startswith("/escape"):
+                self._json(escape_recon())
+                return
             if self.path.startswith("/novel"):
                 self._json(novel_sandbox_probe())
                 return
